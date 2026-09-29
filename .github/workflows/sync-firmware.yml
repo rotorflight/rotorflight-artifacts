@@ -1,0 +1,101 @@
+name: Sync firmware
+
+# Mirrors the .hex files of rotorflight/rotorflight-firmware's releases and
+# snapshots into firmware/<tag>/ in this repo. GitHub release downloads send no
+# CORS headers, so the web configurator can't fetch them from a browser; it
+# fetches these copies through jsDelivr instead:
+#   https://cdn.jsdelivr.net/gh/rotorflight/rotorflight-artifacts@master/firmware/<tag>/<file>
+#
+# Runs hourly, and on demand. Only versions the configurator can flash
+# (MIN_VERSION and newer) are mirrored; directories for releases that no
+# longer exist upstream are removed.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [firmware-released]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-firmware
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: rotorflight/rotorflight-firmware
+  # Oldest firmware the configurator supports (FW_VERSION_RTFL_MIN).
+  MIN_VERSION: 4.3.0
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Mirror release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # "<tag> <number of .hex assets>" for every release with firmware.
+          gh api "repos/$SOURCE_REPO/releases" --paginate \
+            --jq '.[] | select(any(.assets[]; .name | endswith(".hex"))) | "\(.tag_name) \([.assets[] | select(.name | endswith(".hex"))] | length)"' \
+            > releases.txt
+
+          wanted=()
+          while read -r tag count; do
+            case "$tag" in
+              release/*|snapshot/*) ;;
+              *) continue ;;
+            esac
+            # release/4.6.0-RC1 -> 4.6.0, snapshot/4.4.0-20240929 -> 4.4.0.
+            # Old date-only snapshot tags have no version and are skipped.
+            version="${tag#*/}"
+            version="${version%%-*}"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$version" | sort -V | head -1)" != "$MIN_VERSION" ]; then
+              continue
+            fi
+            wanted+=("$tag")
+
+            dir="firmware/$tag"
+            have=$(ls "$dir"/*.hex 2>/dev/null | wc -l)
+            if [ "$have" -eq "$count" ]; then
+              continue
+            fi
+
+            echo "Mirroring $tag ($count files)"
+            rm -rf "$dir"
+            mkdir -p "$dir"
+            gh release download "$tag" --repo "$SOURCE_REPO" --pattern '*.hex' --dir "$dir"
+            git add "$dir"
+            git commit -q -m "firmware: $tag"
+          done < releases.txt
+
+          # Drop mirrors of releases that were deleted upstream.
+          for dir in firmware/release/* firmware/snapshot/*; do
+            [ -d "$dir" ] || continue
+            tag="${dir#firmware/}"
+            if ! printf '%s\n' "${wanted[@]}" | grep -qxF "$tag"; then
+              echo "Removing $tag (no longer released)"
+              git rm -rq "$dir"
+              git commit -q -m "firmware: remove $tag"
+            fi
+          done
+
+          rm -f releases.txt
+          if [ -n "$(git log origin/master..HEAD --oneline)" ]; then
+            git push origin HEAD:master
+          else
+            echo "Already up to date"
+          fi
