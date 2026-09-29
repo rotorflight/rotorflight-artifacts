@@ -44,6 +44,10 @@ jobs:
         run: |
           set -euo pipefail
 
+          # An unmatched glob expands to nothing (needed for counting files in
+          # a directory that doesn't exist yet).
+          shopt -s nullglob
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -69,8 +73,8 @@ jobs:
             wanted+=("$tag")
 
             dir="firmware/$tag"
-            have=$(ls "$dir"/*.hex 2>/dev/null | wc -l)
-            if [ "$have" -eq "$count" ]; then
+            have=("$dir"/*.hex)
+            if [ "${#have[@]}" -eq "$count" ]; then
               continue
             fi
 
