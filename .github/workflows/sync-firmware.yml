@@ -1,7 +1,8 @@
 name: Sync firmware
 
-# Mirrors the .hex files of rotorflight/rotorflight-firmware's releases and
-# snapshots into firmware/<tag>/ in this repo. GitHub release downloads send no
+# Mirrors the .hex files of rotorflight/rotorflight-firmware's releases,
+# snapshots and feature-branch dev builds (dev/<branch>) into firmware/<tag>/
+# in this repo. GitHub release downloads send no
 # CORS headers, so the web configurator can't fetch them from a browser; it
 # fetches these copies through jsDelivr instead:
 #   https://cdn.jsdelivr.net/gh/rotorflight/rotorflight-artifacts@master/firmware/<tag>/<file>
@@ -51,34 +52,41 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # "<tag> <number of .hex assets>" for every release with firmware.
+          # "<tag> <comma-separated .hex asset names>" for every release with
+          # firmware.
           gh api "repos/$SOURCE_REPO/releases" --paginate \
-            --jq '.[] | select(any(.assets[]; .name | endswith(".hex"))) | "\(.tag_name) \([.assets[] | select(.name | endswith(".hex"))] | length)"' \
+            --jq '.[] | select(any(.assets[]; .name | endswith(".hex"))) | "\(.tag_name) \([.assets[] | select(.name | endswith(".hex")) | .name] | join(","))"' \
             > releases.txt
 
           wanted=()
-          while read -r tag count; do
+          while read -r tag names; do
             case "$tag" in
-              release/*|snapshot/*) ;;
+              release/*|snapshot/*)
+                # release/4.6.0-RC1 -> 4.6.0, snapshot/4.4.0-20240929 -> 4.4.0.
+                # Old date-only snapshot tags have no version and are skipped.
+                version="${tag#*/}"
+                version="${version%%-*}"
+                [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$version" | sort -V | head -1)" != "$MIN_VERSION" ]; then
+                  continue
+                fi
+                ;;
+              # Dev builds are always made from a current branch.
+              dev/*) ;;
               *) continue ;;
             esac
-            # release/4.6.0-RC1 -> 4.6.0, snapshot/4.4.0-20240929 -> 4.4.0.
-            # Old date-only snapshot tags have no version and are skipped.
-            version="${tag#*/}"
-            version="${version%%-*}"
-            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-            if [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$version" | sort -V | head -1)" != "$MIN_VERSION" ]; then
-              continue
-            fi
             wanted+=("$tag")
 
+            # Compare file names, not just the count: a dev build replaced by
+            # a newer push has the same number of files under new names.
             dir="firmware/$tag"
-            have=("$dir"/*.hex)
-            if [ "${#have[@]}" -eq "$count" ]; then
+            have=$(for f in "$dir"/*.hex; do basename "$f"; done | LC_ALL=C sort)
+            want=$(tr ',' '\n' <<< "$names" | LC_ALL=C sort)
+            if [ "$have" = "$want" ]; then
               continue
             fi
 
-            echo "Mirroring $tag ($count files)"
+            echo "Mirroring $tag"
             rm -rf "$dir"
             mkdir -p "$dir"
             gh release download "$tag" --repo "$SOURCE_REPO" --pattern '*.hex' --dir "$dir"
@@ -87,7 +95,7 @@ jobs:
           done < releases.txt
 
           # Drop mirrors of releases that were deleted upstream.
-          for dir in firmware/release/* firmware/snapshot/*; do
+          for dir in firmware/release/* firmware/snapshot/* firmware/dev/*; do
             [ -d "$dir" ] || continue
             tag="${dir#firmware/}"
             if ! printf '%s\n' "${wanted[@]}" | grep -qxF "$tag"; then
